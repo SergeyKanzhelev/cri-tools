@@ -48,15 +48,15 @@ type remoteImageService struct {
 }
 
 // NewRemoteImageService creates a new internalapi.ImageManagerService.
-func NewRemoteImageService(endpoint string, connectionTimeout time.Duration, tp trace.TracerProvider, logger *klog.Logger) (internalapi.ImageManagerService, error) {
+func NewRemoteImageService(ctx context.Context, endpoint string, connectionTimeout time.Duration, tp trace.TracerProvider, logger *klog.Logger) (internalapi.ImageManagerService, error) {
 	internal.Log(logger, 3, "Connecting to image service", "endpoint", endpoint)
 	addr, dialer, err := util.GetAddressAndDialer(endpoint)
 	if err != nil {
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, connectionTimeout)
 	defer cancel()
+
 
 	var dialOpts []grpc.DialOption
 	dialOpts = append(dialOpts,

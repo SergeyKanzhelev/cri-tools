@@ -81,13 +81,13 @@ const (
 )
 
 // NewRemoteRuntimeService creates a new internalapi.RuntimeService.
-func NewRemoteRuntimeService(endpoint string, connectionTimeout time.Duration, tp trace.TracerProvider, logger *klog.Logger) (internalapi.RuntimeService, error) {
+func NewRemoteRuntimeService(ctx context.Context, endpoint string, connectionTimeout time.Duration, tp trace.TracerProvider, logger *klog.Logger) (internalapi.RuntimeService, error) {
 	internal.Log(logger, 3, "Connecting to runtime service", "endpoint", endpoint)
 	addr, dialer, err := util.GetAddressAndDialer(endpoint)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, connectionTimeout)
 	defer cancel()
 
 	var dialOpts []grpc.DialOption

@@ -31,6 +31,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -68,9 +70,13 @@ var (
 	DisablePullOnRun bool
 	// tracerProvider is the global OpenTelemetry tracing instance.
 	tracerProvider *sdktrace.TracerProvider
+	// traceContext is the context carrying the root span.
+	traceContext context.Context
+	// rootSpan is the root OpenTelemetry span for the command.
+	rootSpan trace.Span
 )
 
-func getRuntimeService(_ *cli.Context, timeout time.Duration) (res internalapi.RuntimeService, err error) {
+func getRuntimeService(context *cli.Context, timeout time.Duration) (res internalapi.RuntimeService, err error) {
 	if RuntimeEndpointIsSet && RuntimeEndpoint == "" {
 		return nil, errors.New("--runtime-endpoint is not set")
 	}
@@ -106,7 +112,7 @@ func getRuntimeService(_ *cli.Context, timeout time.Duration) (res internalapi.R
 		for _, endPoint := range defaultRuntimeEndpoints {
 			logrus.Debugf("Connect using endpoint %q with %q timeout", endPoint, t)
 
-			res, err = remote.NewRemoteRuntimeService(endPoint, t, tp, &logger)
+			res, err = remote.NewRemoteRuntimeService(context.Context, endPoint, t, tp, &logger)
 			if err != nil {
 				logrus.Error(err)
 
@@ -121,10 +127,10 @@ func getRuntimeService(_ *cli.Context, timeout time.Duration) (res internalapi.R
 		return res, err
 	}
 
-	return remote.NewRemoteRuntimeService(RuntimeEndpoint, t, tp, &logger)
+	return remote.NewRemoteRuntimeService(context.Context, RuntimeEndpoint, t, tp, &logger)
 }
 
-func getImageService(*cli.Context) (res internalapi.ImageManagerService, err error) {
+func getImageService(context *cli.Context) (res internalapi.ImageManagerService, err error) {
 	if ImageEndpoint == "" {
 		if RuntimeEndpointIsSet && RuntimeEndpoint == "" {
 			return nil, errors.New("--image-endpoint is not set")
@@ -157,7 +163,7 @@ func getImageService(*cli.Context) (res internalapi.ImageManagerService, err err
 		for _, endPoint := range defaultRuntimeEndpoints {
 			logrus.Debugf("Connect using endpoint %q with %q timeout", endPoint, Timeout)
 
-			res, err = remote.NewRemoteImageService(endPoint, Timeout, tp, &logger)
+			res, err = remote.NewRemoteImageService(context.Context, endPoint, Timeout, tp, &logger)
 			if err != nil {
 				logrus.Error(err)
 
@@ -172,7 +178,7 @@ func getImageService(*cli.Context) (res internalapi.ImageManagerService, err err
 		return res, err
 	}
 
-	return remote.NewRemoteImageService(ImageEndpoint, Timeout, tp, &logger)
+	return remote.NewRemoteImageService(context.Context, ImageEndpoint, Timeout, tp, &logger)
 }
 
 func getTimeout(timeDuration time.Duration) time.Duration {
@@ -304,6 +310,26 @@ func main() {
 	}()
 
 	app.Before = func(context *cli.Context) (err error) {
+		// Configure tracing if enabled
+		if context.IsSet("enable-tracing") {
+			tracerProvider, err = tracing.Init(
+				context.Context,
+				context.String("tracing-endpoint"),
+				context.Int("tracing-sampling-rate-per-million"),
+			)
+			if err != nil {
+				return fmt.Errorf("init tracing: %w", err)
+			}
+
+			spanName := "crictl"
+			if context.Args().Present() {
+				spanName = context.Args().First()
+			}
+			traceContext, rootSpan = tracerProvider.Tracer("sigs.k8s.io/cri-tools/cmd/crictl").Start(context.Context, spanName)
+			rootSpan.SetAttributes(attribute.String("command", spanName))
+			context.Context = traceContext
+		}
+
 		var config *common.ServerConfiguration
 
 		var exePath string
@@ -402,18 +428,6 @@ func main() {
 			logrus.SetLevel(logrus.DebugLevel)
 		}
 
-		// Configure tracing if enabled
-		if context.IsSet("enable-tracing") {
-			tracerProvider, err = tracing.Init(
-				context.Context,
-				context.String("tracing-endpoint"),
-				context.Int("tracing-sampling-rate-per-million"),
-			)
-			if err != nil {
-				return fmt.Errorf("init tracing: %w", err)
-			}
-		}
-
 		return nil
 	}
 
@@ -452,7 +466,28 @@ func main() {
 	sort.Sort(cli.FlagsByName(app.Flags))
 
 	if err := app.Run(os.Args); err != nil {
-		logrus.Fatal(err)
+		if rootSpan != nil {
+			rootSpan.SetStatus(codes.Error, err.Error())
+			rootSpan.RecordError(err)
+		}
+		logrus.Error(err)
+
+		// Ensure that all spans are processed.
+		if tracerProvider != nil {
+			if rootSpan != nil {
+				rootSpan.End()
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := tracerProvider.Shutdown(shutdownCtx); err != nil {
+				logrus.Errorf("Unable to shutdown tracer provider: %v", err)
+			}
+			cancel()
+		}
+		os.Exit(1)
+	}
+
+	if rootSpan != nil {
+		rootSpan.End()
 	}
 
 	// Ensure that all spans are processed.
